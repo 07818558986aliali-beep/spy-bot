@@ -1,0 +1,272 @@
+import random
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+import os
+TOKEN = os.environ.get("TOKEN", "ضع_التوكن_هنا")
+MIN_PLAYERS, MAX_PLAYERS = 4, 12
+
+ROLE_NAMES = {
+    "mayor": "👑 عمدة الصالحين",
+    "doctor": "🩺 دكتور الصالحين",
+    "citizen": "🙂 من الصالحين",
+    "leader": "🕴️ كبير الجواسيس",
+    "silencer": "🤐 جاسوس التسكيت",
+    "spy": "🕵️ جاسوس",
+}
+SPY_ROLES = {"leader", "silencer", "spy"}
+ROLE_INFO = {
+    "mayor": "انت من الصالحين.\nتكدر تكشف نفسك بأي وقت بالنهار بالزر اللي تحت، وبعدها صوتك يحسب بصوتين.\nانتبه: إذا انكشفت بدري يغتالوك!",
+    "doctor": "انت من الصالحين.\nكل ليلة تختار واحد تحميه. إذا اخترت نفس الشخص اللي حاولوا يغتالونه، تشفيه وينجو.",
+    "citizen": "انت من الصالحين.\nما عندك قدرة خاصة، ناقش وصوّت حتى تكشف الجواسيس.",
+    "leader": "انت من الجواسيس.\nكل ليلة تغتال شخص من الصالحين.\nإذا انقتلت، واحد من جواسيسك يرث الاغتيال.",
+    "silencer": "انت من الجواسيس.\nكل ليلة تسكّت شخص: ما يكدر يحچي ولا يصوّت ولا يسوي أي شي بذاك الدور.",
+    "spy": "انت من الجواسيس.\nما عندك قدرة، بس تخفّى وساعد فريقك.",
+}
+ACTION_PROMPTS = {"kill": "🗡️ اختر من تغتاله الليلة:", "silence": "🤐 اختر من تسكّته:", "heal": "🩺 اختر من تحميه الليلة:"}
+games = {}
+user_game = {}
+
+def pname(g, uid): return g["players"][uid]
+def is_spy(g, uid): return g["roles"][uid] in SPY_ROLES
+def holder(g, ability):
+    for u in g["alive"]:
+        if ability in g["abilities"][u]: return u
+    return None
+def eligible(g): return [u for u in g["alive"] if u not in g["silenced"]]
+def end_game(chat_id):
+    g = games.pop(chat_id, None)
+    if g:
+        for u in g["players"]: user_game.pop(u, None)
+def check_win(g):
+    spies = sum(1 for u in g["alive"] if is_spy(g, u))
+    good = len(g["alive"]) - spies
+    if spies == 0: return "good"
+    if spies >= good: return "spy"
+    return None
+def lobby_text(g):
+    names = "\n".join(f"{i+1}. {n}" for i, n in enumerate(g["players"].values()))
+    return f"🕵️ لعبة الجاسوس (الأدوار)\n\nاللاعبين ({len(g['players'])}/{MAX_PLAYERS}):\n{names}\n\nاضغط انضمام. المضيف يكتب /startgame عند الجاهزية."
+def join_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ انضمام", callback_data="join"), InlineKeyboardButton("🚪 خروج", callback_data="leave")]])
+
+async def start(update, context):
+    await update.message.reply_text("هلا! 👋 هذا بوت لعبة الجاسوس.\nافتح البوت هنا حتى أكدر أرسل لك دورك بالخاص.\nارجع للكروب واكتب /newgame")
+
+async def newgame(update, context):
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text("استخدم هذا الأمر داخل الكروب."); return
+    old = games.get(chat.id)
+    if old and old["state"] != "lobby":
+        await update.message.reply_text("فيه لعبة شغالة. المضيف يكتب /cancel لإلغائها."); return
+    if old: end_game(chat.id)
+    user = update.effective_user
+    if user.id in user_game:
+        await update.message.reply_text("انت داخل لعبة ثانية، اطلع منها أولاً."); return
+    g = {"host": user.id, "players": {user.id: user.first_name}, "state": "lobby", "round": 0, "roles": {}, "alive": set(), "abilities": {}, "mayor_revealed": False, "night": {}, "silenced": set(), "votes": {}, "pending_roles": None}
+    games[chat.id] = g; user_game[user.id] = chat.id
+    await update.message.reply_text(lobby_text(g), reply_markup=join_keyboard())
+
+async def lobby_button(update, context):
+    q = update.callback_query; chat_id = q.message.chat_id; g = games.get(chat_id)
+    if not g or g["state"] != "lobby":
+        await q.answer("ماكو لعبة مفتوحة.", show_alert=True); return
+    user = q.from_user
+    if q.data == "join":
+        if user.id in g["players"]: await q.answer("انت منضم من قبل."); return
+        if user.id in user_game: await q.answer("انت داخل لعبة ثانية.", show_alert=True); return
+        if len(g["players"]) >= MAX_PLAYERS: await q.answer("اللعبة ممتلئة (12).", show_alert=True); return
+        g["players"][user.id] = user.first_name; user_game[user.id] = chat_id
+    else:
+        if g["players"].pop(user.id, None) is not None: user_game.pop(user.id, None)
+        if not g["players"]:
+            games.pop(chat_id, None); await q.edit_message_text("انلغت اللعبة لأن الكل طلع."); return
+        if g["host"] == user.id: g["host"] = next(iter(g["players"]))
+    await q.answer()
+    try: await q.edit_message_text(lobby_text(g), reply_markup=join_keyboard())
+    except Exception: pass
+
+async def startgame(update, context):
+    chat_id = update.effective_chat.id; g = games.get(chat_id)
+    if not g or g["state"] != "lobby":
+        await update.message.reply_text("اكتب /newgame أولاً."); return
+    if update.effective_user.id != g["host"]:
+        await update.message.reply_text("فقط المضيف يبدأ اللعبة."); return
+    n = len(g["players"])
+    if n < MIN_PLAYERS:
+        await update.message.reply_text(f"لازم {MIN_PLAYERS} لاعبين على الأقل. الحالي: {n}"); return
+    # FIX: لا تعيد الخلط عند إعادة المحاولة، حتى لا يستلم اللاعب دورين مختلفين
+    if not g.get("pending_roles"):
+        ids = list(g["players"]); random.shuffle(ids)
+        spy_count = (n + 3) // 4
+        roles_list = ["leader", "silencer", "spy"][:spy_count] + ["mayor", "doctor"] + ["citizen"] * (n - spy_count - 2)
+        g["pending_roles"] = dict(zip(ids, roles_list)); g["pending_spy_count"] = spy_count
+    roles = g["pending_roles"]; spy_count = g["pending_spy_count"]
+    ids = list(roles.keys()); team = [u for u in ids if roles[u] in SPY_ROLES]
+    failed = []
+    for uid in ids:
+        r = roles[uid]; text = f"{ROLE_NAMES[r]}\n\n{ROLE_INFO[r]}"
+        if r in SPY_ROLES and spy_count > 1:
+            text += "\n\nفريقك:\n" + "\n".join(f"- {g['players'][u]}: {ROLE_NAMES[roles[u]]}" for u in team if u != uid)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("👑 اكشف نفسي", callback_data=f"mayor:{chat_id}")]]) if r == "mayor" else None
+        try: await context.bot.send_message(uid, text, reply_markup=markup)
+        except Exception: failed.append(g["players"][uid])
+    if failed:
+        me = await context.bot.get_me()
+        await update.message.reply_text("ما كدرت أرسل الدور لـ: " + "، ".join(failed) + f"\nلازم يفتحون البوت بالخاص ويضغطون Start:\nhttps://t.me/{me.username}\nبعدها اكتب /startgame مرة ثانية (نفس الأدوار محفوظة، لا تهتم بالرسائل القديمة).")
+        return
+    abilities = {u: set() for u in ids}
+    for u, r in roles.items():
+        if r == "leader": abilities[u].add("kill")
+        elif r == "silencer": abilities[u].add("silence")
+        elif r == "doctor": abilities[u].add("heal")
+    g.update(roles=roles, alive=set(ids), abilities=abilities, pending_roles=None)
+    await update.message.reply_text(f"🎲 تم توزيع الأدوار على {n} لاعبين، شيكوا الخاص!\n🕵️ عدد الجواسيس: {spy_count}\nالصالحين فيهم: 👑 عمدة و 🩺 دكتور.")
+    await start_night(context, chat_id)
+
+async def start_night(context, chat_id):
+    g = games[chat_id]; g["round"] += 1; g["state"] = "night"; g["silenced"] = set(); g["night"] = {}
+    await context.bot.send_message(chat_id, f"🌙 الليلة {g['round']}: الكل يغمض عيونه...\nأصحاب القدرات يشيكون الخاص ويختارون.")
+    for uid in list(g["alive"]):
+        for ab in list(g["abilities"][uid]): await send_action_menu(context, chat_id, uid, ab)
+
+async def send_action_menu(context, chat_id, uid, ab):
+    g = games[chat_id]; rows = []
+    for t in g["alive"]:
+        if ab != "heal" and t == uid: continue
+        if ab == "kill" and is_spy(g, t): continue
+        rows.append([InlineKeyboardButton(pname(g, t), callback_data=f"act:{chat_id}:{g['round']}:{ab}:{t}")])
+    if not rows: return
+    try: await context.bot.send_message(uid, f"الليلة {g['round']}\n{ACTION_PROMPTS[ab]}", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception: pass
+
+async def night_action(update, context):
+    q = update.callback_query; _, chat_id, rnd, ab, target = q.data.split(":"); chat_id, rnd, target = int(chat_id), int(rnd), int(target); g = games.get(chat_id); uid = q.from_user.id
+    if not g or g["state"] != "night" or rnd != g["round"] or uid not in g["alive"] or ab not in g["abilities"].get(uid, set()):
+        await q.answer("هذا الاختيار ما عاد صالح.", show_alert=True); return
+    if ab in g["night"]: await q.answer("اخترت من قبل.", show_alert=True); return
+    if target not in g["alive"]: await q.answer("هذا اللاعب مو موجود.", show_alert=True); return
+    g["night"][ab] = target; await q.answer(); await q.edit_message_text(f"✅ اخترت: {pname(g, target)}")
+    needed = set()
+    for u in g["alive"]: needed |= g["abilities"][u]
+    if needed <= set(g["night"]): await resolve_night(context, chat_id)
+
+async def kill_player(context, g, uid, lines, prefix):
+    role = g["roles"][uid]; g["alive"].discard(uid); had_kill = "kill" in g["abilities"][uid]; g["abilities"][uid] = set()
+    lines.append(f"{prefix} {pname(g, uid)}! كان {ROLE_NAMES[role]}")
+    if had_kill:
+        spies = [u for u in g["alive"] if is_spy(g, u)]
+        if spies:
+            plain = [u for u in spies if g["roles"][u] == "spy"]; new = random.choice(plain or spies); g["abilities"][new].add("kill")
+            try: await context.bot.send_message(new, "🕴️ كبير الجواسيس انقتل! ورثت منه الاغتيال، من الليلة انت تغتال.")
+            except Exception: pass
+
+async def resolve_night(context, chat_id):
+    g = games[chat_id]; g["state"] = "resolving"; n = g["night"]; kill, heal, silenced = n.get("kill"), n.get("heal"), n.get("silence")
+    if silenced is not None:
+        if holder(g, "kill") == silenced: kill = None
+        if holder(g, "heal") == silenced: heal = None
+    dies = kill if (kill is not None and kill != heal) else None
+    lines = [f"☀️ طلع الصباح (الجولة {g['round']})"]
+    if silenced is not None and silenced != dies:
+        g["silenced"] = {silenced}; lines.append(f"🤐 {pname(g, silenced)} انسكّت! اليوم ما يحچي ولا يصوّت ولا يسوي شي.")
+        try: await context.bot.send_message(silenced, "🤐 تم تسكيتك! اليوم ما تكدر تحچي ولا تصوّت ولا تكشف نفسك، وأي قدرة اخترتها هالليلة انلغت.")
+        except Exception: pass
+    else: g["silenced"] = set()
+    if kill is None: lines.append("🕊️ مرت الليلة بدون اغتيال.")
+    elif kill == heal: lines.append(f"🏥 حاولوا يغتالون {pname(g, kill)} لكن الدكتور شفاه وبقى حي!")
+    else: await kill_player(context, g, kill, lines, "💀 اغتالوا")
+    winner = check_win(g)
+    if winner:
+        await context.bot.send_message(chat_id, "\n".join(lines)); await finish_game(context, chat_id, winner); return
+    g["state"] = "day"; alive = "، ".join(pname(g, u) for u in g["alive"]); lines.append(f"\n👥 الأحياء: {alive}"); lines.append("💬 النقاش مفتوح. المضيف يكتب /vote لبدء التصويت.")
+    await context.bot.send_message(chat_id, "\n".join(lines))
+
+async def finish_game(context, chat_id, winner):
+    g = games[chat_id]; title = "🎉 فاز الصالحين! انكشفوا كل الجواسيس." if winner == "good" else "🕵️ فاز الجواسيس! سيطروا على المدينة."
+    roles = "\n".join(f"{ROLE_NAMES[g['roles'][u]]}: {pname(g, u)}" + ("" if u in g["alive"] else " 💀") for u in g["players"])
+    await context.bot.send_message(chat_id, f"{title}\n\nالأدوار:\n{roles}\n\n/newgame لجولة جديدة"); end_game(chat_id)
+
+def vote_text(g):
+    voted = [pname(g, u) for u in g["votes"]]; waiting = [pname(g, u) for u in eligible(g) if u not in g["votes"]]; silenced = [pname(g, u) for u in g["silenced"]]
+    t = f"🗳️ التصويت (الجولة {g['round']})\n\n✅ صوّت: {'، '.join(voted) or '-'}\n⏳ ينتظرون: {'، '.join(waiting) or '-'}"
+    if silenced: t += f"\n🤐 مسكّت (ما يصوّت): {'، '.join(silenced)}"
+    return t
+def vote_keyboard(g, chat_id):
+    # FIX: chat_id بالـ callback + لا تظهر زر التصويت لنفسك
+    rows = []
+    for t in g["alive"]:
+        rows.append([InlineKeyboardButton(pname(g, t), callback_data=f"vote:{chat_id}:{g['round']}:{t}")])
+    rows.append([InlineKeyboardButton("⏭ تخطي (ما أطلّع أحد)", callback_data=f"vote:{chat_id}:{g['round']}:0")])
+    return InlineKeyboardMarkup(rows)
+
+async def cmd_vote(update, context):
+    chat_id = update.effective_chat.id; g = games.get(chat_id)
+    if not g or g["state"] != "day": await update.message.reply_text("التصويت يبدأ بعد الليل فقط."); return
+    if update.effective_user.id != g["host"]: await update.message.reply_text("فقط المضيف يبدأ التصويت."); return
+    g["state"] = "vote"; g["votes"] = {}
+    await update.message.reply_text(vote_text(g), reply_markup=vote_keyboard(g, chat_id))
+
+async def vote_button(update, context):
+    q = update.callback_query; _, chat_id, rnd, target = q.data.split(":"); chat_id, rnd, target = int(chat_id), int(rnd), int(target); g = games.get(chat_id); uid = q.from_user.id
+    if not g or g["state"] != "vote" or rnd != g["round"]:
+        await q.answer("التصويت مو شغال.", show_alert=True); return
+    if uid not in g["alive"]: await q.answer("الأحياء فقط يصوّتون.", show_alert=True); return
+    if uid in g["silenced"]: await q.answer("🤐 انت مسكّت، ما تكدر تصوّت.", show_alert=True); return
+    if target == uid: await q.answer("ما تكدر تصوّت لنفسك.", show_alert=True); return
+    if target != 0 and target not in g["alive"]: await q.answer("هذا اللاعب مو حي.", show_alert=True); return
+    g["votes"][uid] = target; await q.answer("تم تسجيل صوتك")
+    if all(u in g["votes"] for u in eligible(g)): await resolve_vote(context, chat_id)
+    else:
+        try: await q.edit_message_text(vote_text(g), reply_markup=vote_keyboard(g, chat_id))
+        except Exception: pass
+
+async def resolve_vote(context, chat_id):
+    g = games[chat_id]; g["state"] = "resolving"; tally = {}
+    for voter, target in g["votes"].items():
+        w = 2 if (g["roles"][voter] == "mayor" and g["mayor_revealed"]) else 1; tally[target] = tally.get(target, 0) + w
+    lines = ["📊 نتيجة التصويت:"]
+    for t, c in sorted(tally.items(), key=lambda x: -x[1]): lines.append(f"- {'تخطي' if t == 0 else pname(g, t)}: {c}")
+    if not tally: lines.append("- ماكو أصوات")
+    top = max(tally.values()) if tally else 0; leaders = [t for t, c in tally.items() if c == top]
+    if not tally or len(leaders) > 1 or leaders[0] == 0: lines.append("\n⚖️ ما انطلع أحد.")
+    else: await kill_player(context, g, leaders[0], lines, "\n⚖️ تم إقصاء")
+    winner = check_win(g); await context.bot.send_message(chat_id, "\n".join(lines))
+    if winner: await finish_game(context, chat_id, winner); return
+    await start_night(context, chat_id)
+
+async def endvote(update, context):
+    g = games.get(update.effective_chat.id)
+    if g and g["state"] == "vote" and update.effective_user.id == g["host"]: await resolve_vote(context, update.effective_chat.id)
+async def endnight(update, context):
+    g = games.get(update.effective_chat.id)
+    if g and g["state"] == "night" and update.effective_user.id == g["host"]: await resolve_night(context, update.effective_chat.id)
+
+async def mayor_button(update, context):
+    q = update.callback_query; chat_id = int(q.data.split(":")[1]); g = games.get(chat_id); uid = q.from_user.id
+    if not g or g["state"] == "lobby" or uid not in g["alive"] or g["roles"].get(uid) != "mayor":
+        await q.answer("هذا الزر ما عاد صالح.", show_alert=True); return
+    # FIX: العمدة يكشف نفسه بالنهار فقط، مو بالليل
+    if g["state"] not in ("day", "vote"):
+        await q.answer("تكدر تكشف نفسك بالنهار فقط.", show_alert=True); return
+    if g["mayor_revealed"]: await q.answer("انكشفت من قبل.", show_alert=True); return
+    if uid in g["silenced"]: await q.answer("🤐 انت مسكّت، ما تكدر تكشف نفسك اليوم.", show_alert=True); return
+    g["mayor_revealed"] = True; await q.answer("تم!")
+    await context.bot.send_message(chat_id, f"👑 {pname(g, uid)} كشف نفسه: هو عمدة الصالحين! صوته من الآن بصوتين.")
+
+async def status(update, context):
+    g = games.get(update.effective_chat.id)
+    if not g or g["state"] == "lobby": await update.message.reply_text("ماكو لعبة شغالة."); return
+    alive = "، ".join(pname(g, u) for u in g["alive"]); dead = "، ".join(pname(g, u) for u in g["players"] if u not in g["alive"]) or "-"
+    await update.message.reply_text(f"الجولة {g['round']}\n👥 الأحياء: {alive}\n💀 الأموات: {dead}")
+async def cancel(update, context):
+    g = games.get(update.effective_chat.id)
+    if g and update.effective_user.id == g["host"]: end_game(update.effective_chat.id); await update.message.reply_text("انلغت اللعبة.")
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("newgame", newgame)); app.add_handler(CommandHandler("startgame", startgame)); app.add_handler(CommandHandler("vote", cmd_vote)); app.add_handler(CommandHandler("endvote", endvote)); app.add_handler(CommandHandler("endnight", endnight)); app.add_handler(CommandHandler("status", status)); app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(lobby_button, pattern=r"^(join|leave)$")); app.add_handler(CallbackQueryHandler(night_action, pattern=r"^act:")); app.add_handler(CallbackQueryHandler(vote_button, pattern=r"^vote:")); app.add_handler(CallbackQueryHandler(mayor_button, pattern=r"^mayor:"))
+    app.run_polling()
+if __name__ == "__main__": main()
